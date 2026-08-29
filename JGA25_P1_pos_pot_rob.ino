@@ -1,136 +1,146 @@
-/*
-  CONTROLADOR PID PARA REGULACIÓN DE LA POSICIÓN
-  DE UN MOTOR DE CD MODELO JGA25-175
-
-  Trayectoria senoidal:
-  th_des(t) = amplitud * sin(2*pi*frecuencia*t)
-
+/* 
+  CONTROLADOR PID PARA REGULACIÓN DE LA POSICIÓN DE UN MOTOR DE CD MODELO JGA25-175
   TECNOLÓGICO DE MONTERREY CAMPUS GUADALAJARA
   PROFESOR: DR. JOSE LUIS LUNA PINEDA
+
+  Este programa implementa un control PID para posicionar un motor de corriente directa
+  usando lectura de encoder en cuadratura doble (X2). La señal de control se calcula como:
+  u = kP*E - kD*dth_f + kI*int(e)
+
+  Se incluye filtrado de velocidad, saturación de señal PWM y lectura de consigna por monitor serial.
 */
 
 // ----- TIEMPO DE MUESTREO -----
-const int dt_us = 4000;
-const float dt = dt_us * 0.000001;
-unsigned long t1 = 0, t2 = 0;
-
-// ----- TRAYECTORIA SENOIDAL -----
-float amplitud = 45.0;
-float frecuencia = 0.05;
-float t_trayectoria = 0.0;
-unsigned long t_inicio;
+int dt_us = 4000;                      // Muestreo cada 4 ms----> para este caso puede ser entre 1 ms y 5 ms
+float dt = dt_us * 0.000001;           // Tiempo en segundos para el cálculo de la derivada y la integral
+unsigned long t1 = 0, t2 = 0;          // Estos tiempos son para crear un tiempo de muestreo constante "estable"
 
 // ----- ENCODER -----
-volatile int Np = 0;
-const float R = 360.0 / (2.0 * 17.0 * 49.0);
-float th = 0.0, thp = 0.0;
-float error_threshold = 1.0 * R;
+volatile int Np = 0;                   // Conteo de pulsos del encoder
+// En este programa solo se toma dos flancos de subida, CUADRATURA doble
+const float R = (360.0/(2.0*17.0*49.0));  // Resolución angular (R)=  360°/(cuadratura_doble*pulsos_encoder*gear ratio)
+// Para el MOTOR DE CD MODELO JGA25-175: 360.0/(2.0*11.0*34.0)
+float th = 0, thp = 0;                 // th es ángulo actual.---> thp es el valor del ángulo pasado.
+float error_threshold = 1.0 * R;       // Umbral de seguridad: si el error es menor a 2 pulsos se apaga la señal PWM
 
 // ----- VELOCIDAD -----
-float dth_d = 0.0, dth_f = 0.0;
-float alpha = 0.03;
+float dth_d = 0, dth_f = 0;
+float alpha = 0.03;                    // Se usa para el filtro de velocidad entre 0 y 1
+// alpha cercano a 1 → más reactivo (menos suave)    alpha cercano a 0 → más lento pero más suave
 
 // ----- CONTROL PID -----
-float kp = 0.0, kd = 0.0, ki = 0.0;
-float e = 0.0, de = 0.0, inte = 0.0;
-float u = 0.0, usat = 0.0;
-float PWM = 0.0;
-float th_des = 0.0;
+float kp = 0.0  , kd = 0.0, ki = 0.0;     // AJUSTE DE LAS GANANCIAS DEL CONTROLADOR PID
+// RECUERDE USAR VALORES PEQUEÑOS DE K_d PARA NO AMPLIFICAR EL RUIDO DE MEDICIÓN
+// SUGERENCIA: USAR ENTRADAS ANALÓGICAS PARA AJUSTARLAS USANDO POTENCIOMETROS, DELIMITE EL VALOR COMO SIGUE:
+// 0<=K_p<=25----0<=K_d<=2-------0<=K_i<=10
+float b_est= 155.696;
+float a_est=34.970;
+// ----- AJUSTE DINÁMICO DE kp kd y ki -----
+const int pin_kp = 32;                 // Pin analógico para ajustar kp con potenciómetro
+const int pin_kd = 34;                 // Pin analógico para ajustar kd con potenciómetro
+const int pin_ki = 35;                 // Pin analógico para ajustar ki con potenciómetro
 
-// ----- AJUSTE DINÁMICO DE kp, kd y ki -----
-const int pin_kp = 32;
-const int pin_kd = 34;
-const int pin_ki = 35;
+float e = 0, de = 0, inte = 0;
+float u = 0, usat = 0;
+float PWM = 0;
+float th_des = 0;                      // EL VALOR DE REFERENCIA DESEADO INICIAL ES CERO. ESTABLEZCA LA REFERENCIA EN EL MONITOR SERIAL
 
-// ----- PINES DE CONTROL -----
-const int sen1 = 13;
-const int sen2 = 27;
+// ----- PINES DE CONTROL ----- SIEMPRE VERIFIQUE LA DIRECCIÓN DEL MOTOR 
+const int sen1 = 13;    // Dirección 1 EN EL CASO DE USAR EL PUENTE H BTS7986 CORRESPONDE LPWM O RPWM
+const int sen2 = 27;    // Dirección 2 EN EL CASO DE USAR EL PUENTE H BTS7986 CORRESPONDE LPWM O RPWM
 
-// ----- INTERRUPCIONES -----
+String consigna; // SIRVE PARA GUARDAR EL VALOR DEL MONITOR SERIAL COMO UN STRING
+
 void IRAM_ATTR CH_A();
 void IRAM_ATTR CH_B();
 
 void setup() {
   Serial.begin(115200);
 
-  pinMode(25, INPUT_PULLUP);
-  pinMode(26, INPUT_PULLUP);
+  pinMode(25, INPUT_PULLUP);  // Canal A del encoder.
+  pinMode(26, INPUT_PULLUP);  // Canal B
 
-  attachInterrupt(digitalPinToInterrupt(25), CH_A, RISING);
+  attachInterrupt(digitalPinToInterrupt(25), CH_A, RISING); // Generación de las interrupciones para el pin 2 cuando detecta un flanco de subida
   attachInterrupt(digitalPinToInterrupt(26), CH_B, RISING);
 
-  ledcAttach(13, 10000, 12);
-  ledcAttach(27, 10000, 12);
-
-  t_inicio = micros();
-
-  ledcWrite(sen1, 0);
-  ledcWrite(sen2, 0);
+  // Asignación de los pines usados como PWM como salidas
+  ledcAttach(13,10000,12);
+  ledcAttach(27,10000,12);
 }
 
 void loop() {
 
-  // ----- INICIO DEL PERIODO DE MUESTREO -----
-  t1 = micros();
-
-  // ----- PARADA DE EMERGENCIA -----
-  if (Serial.available() > 0) {
+   if (Serial.available() > 0) {
     char tecla = Serial.read();
 
     if (tecla == 'q' || tecla == 'Q') {
-      ledcWrite(sen1, 0);
-      ledcWrite(sen2, 0);
-
-      while (true) {
-        ledcWrite(sen1, 0);
-        ledcWrite(sen2, 0);
-        delay(100);
-      }
+      Serial.end();  // Detiene la comunicación Serial
     }
   }
+  
+  t1 = micros();  // Marca de inicio
 
-  // ----- TRAYECTORIA SENOIDAL -----
-  t_trayectoria = (micros() - t_inicio) * 0.000001;
-  th_des = amplitud * sin(2.0 * PI * frecuencia * t_trayectoria);
+  // ----- LECTURA DE CONSIGNA -----
+  if (Serial.available() > 0) {
+    consigna = Serial.readStringUntil('\n');
+    th_des = consigna.toFloat(); // Toma el valor del monitor serial y lo guarda en la variable, inicialmente es cero.
+  }
 
-  // ----- AJUSTE DINÁMICO DE kp, kd y ki -----
-  kp = analogRead(pin_kp) * (25.0 / 4095.0);
-  kd = analogRead(pin_kd) * (2.0 / 4095.0);
-  ki = analogRead(pin_ki) * (10.0 / 4095.0);
+// ----- AJUSTE DINÁMICO DE kp kd y ki -----
+   kp = analogRead(pin_kp) * (200.0 / 4095.0); // Escala de 0 a 25 usando potenciómetro
+   kd = analogRead(pin_kd) * (10.0 / 4095.0); // Escala de 0 a 1 usando potenciómetro
+   ki = analogRead(pin_ki) * (130.0 / 4095.0); // Escala de 0 a 15 usando potenciómetro
 
-  // ----- POSICIÓN -----
-  th = R * Np;
-
-  // ----- VELOCIDAD -----
+  // ----- POSICIÓN Y VELOCIDAD -----
+  th = R * Np; // Np se calcula con las rutinas de interrupción, nos da los pulsos, al multiplicarlo por R obtenemos el ángulo en grados
+  // Si cambiamos 360 por 1, medimos revoluciones.
   dth_d = (th - thp) / dt;
-  dth_f = alpha * dth_d + (1.0 - alpha) * dth_f;
 
-  // ----- PID -----
-  e = th_des - th;
-  de = -dth_f;
-  inte += e * dt;
+  // Filtro de primer orden tipo IIR (filtro exponencial) o también conocido como filtro de media exponencial móvil
+  // Ecuación general ----> y[n]=alpha*x[n]+(1-alpha)y[n-1]
+  dth_f = alpha * dth_d + (1 - alpha) * dth_f;
+  //   Si modelamos el filtro como:
+// D_f(s) = \frac{α}{s + α}·D(s)
+// donde:
+// - D(s) es la velocidad angular sin filtrar (entrada),
+// - D_f(s) es la salida filtrada,
+// - α representa el coeficiente que regula la suavidad (en segundos⁻¹)
 
-  u = kp * e + kd * de + ki * inte;
+// Interpretación física
+// - Este filtro atenua frecuencias altas (ruido) y pasa las bajas (variaciones reales).
+// - La constante de tiempo es τ = \frac{1}{α}, lo que define qué tan rápido responde el sistema.
+// - Si α es pequeño, el filtro es más lento (más suavizado). Si α es grande, responde más rápido pero suaviza menos.
 
-  // ----- SATURACIÓN -----
-  usat = constrain(u, -4095, 4095);
+// Es un equivalente del filtro analógico de primer orden transformado por el método de diferencia finita (Euler).
+
+  // ----- PID ----- 
+  e = th_des - th;         // PRIMERO CALCULAMOS EL ERROR PARA PODER GENERAR LA SEÑAL DE CONTROL U
+  de = -dth_f;             // USAMOS LA DERIVADA DE LA SALIDA PERO FILTRADA
+  inte += e * dt;          // CALCULAMOS EL VALOR DE LA INTEGRAL
+   u =( kp * e + kd * de  + ki * inte); // OBTENEMOS EL VALOR DE LA SEÑAL DE CONTROL
+  //u = (1.0 / b_est) * (kp * e - kd * dth_f - beta * dth_f + beta * kp * inte - beta * kd * th);
+  //u =(1.0/b_est)*( kp * e + kd * de + ki * inte); // OBTENEMOS EL VALOR DE LA SEÑAL DE CONTROL
+  // RECUERDE QUE TENEMOS VALORES LÍMITE ENTRE -255 Y 255 POR LO TANTO DEBEMOS CUIDAR EL VALOR
+  // QUE USAMOS EN LAS GANANCIAS KP, KD Y KI PARA NO SATURAR EL SISTEMA
+
+  usat = constrain(u, -4095, 4095); // Esto porque el PWM en Arduino es de 8 bits por lo tanto va de 0 a 255.
   PWM = usat;
 
-  // ----- CONTROL PWM -----
+
+  // ----- CONTROL PWM CON DETECCIÓN DE UMBRAL DE ERROR -----
   if (abs(e) < error_threshold) {
+    // Error pequeño: apaga PWM
     ledcWrite(sen1, 0);
     ledcWrite(sen2, 0);
-  } 
-  else {
-
+  } else {
     if (PWM > 0) {
-      ledcWrite(sen1, (int)PWM);
+      ledcWrite(sen1, PWM);
       ledcWrite(sen2, 0);
     }
 
     if (PWM < 0) {
       ledcWrite(sen1, 0);
-      ledcWrite(sen2, (int)(-PWM));
+      ledcWrite(sen2, -PWM);
     }
 
     if (PWM == 0) {
@@ -142,31 +152,32 @@ void loop() {
   // ----- ACTUALIZACIONES -----
   thp = th;
 
-  // ----- SERIAL PLOTTER -----
-  Serial.print(th_des);
-  Serial.print(" ");
-  Serial.print(th);
-  Serial.print(" ");
-  Serial.print(e);
-  Serial.print(" ");
-  Serial.println(PWM);
+ Serial.print(kp); Serial.print(' '); 
+ Serial.print(kd); Serial.print(' '); 
+ Serial.print(ki); Serial.print(' '); 
+ Serial.print(th_des); Serial.print(' '); 
+ Serial.print(th); Serial.print(' '); 
+ Serial.println(PWM);
 
-  // ----- ESPERA DE MUESTREO -----
+  // Espera activa para mantener la frecuencia
   t2 = micros();
-
   while ((t2 - t1) < dt_us) {
     t2 = micros();
   }
 }
 
-// ----- INTERRUPCIÓN CANAL A -----
+// Función que se ejecuta al detectar una subida en el canal A
 void IRAM_ATTR CH_A() {
-  if (digitalRead(26) == LOW) Np++;
-  if (digitalRead(26) == HIGH) Np--;
+  if (digitalRead(26) == LOW)
+    Np = Np + 1;
+  if (digitalRead(26) == HIGH)
+    Np = Np - 1;
 }
 
-// ----- INTERRUPCIÓN CANAL B -----
+// Función que se ejecuta al detectar una subida en el canal B
 void IRAM_ATTR CH_B() {
-  if (digitalRead(25) == HIGH) Np++;
-  if (digitalRead(25) == LOW) Np--;
+  if (digitalRead(25) == HIGH)
+    Np = Np + 1;
+  if (digitalRead(25) == LOW)
+    Np = Np - 1;
 }
